@@ -18,7 +18,7 @@ from src.utils.camera_util import (
     get_zero123plus_input_cameras,
     get_circular_camera_poses,
 )
-from src.utils.mesh_util import save_obj, save_glb, save_stl
+from src.utils.mesh_util import save_obj, save_glb
 from src.utils.infer_util import remove_background, resize_foreground, images_to_video
 
 import tempfile
@@ -165,7 +165,6 @@ def make_mesh(mesh_fpath, planes):
     mesh_basename = os.path.basename(mesh_fpath).split('.')[0]
     mesh_dirname = os.path.dirname(mesh_fpath)
     mesh_glb_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.glb")
-    mesh_stl_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.stl")
         
     with torch.no_grad():
         # get mesh
@@ -180,12 +179,11 @@ def make_mesh(mesh_fpath, planes):
         vertices = vertices[:, [1, 2, 0]]
         
         save_glb(vertices, faces, vertex_colors, mesh_glb_fpath)
-        save_stl(vertices, faces, mesh_stl_fpath)
         save_obj(vertices, faces, vertex_colors, mesh_fpath)
         
         print(f"Mesh saved to {mesh_fpath}")
 
-    return mesh_fpath, mesh_glb_fpath, mesh_stl_fpath
+    return mesh_fpath, mesh_glb_fpath
 
 
 def make3d(images):
@@ -241,46 +239,16 @@ def make3d(images):
 
         print(f"Video saved to {video_fpath}")
 
-    mesh_fpath, mesh_glb_fpath, mesh_stl_fpath = make_mesh(mesh_fpath, planes)
+    mesh_fpath, mesh_glb_fpath = make_mesh(mesh_fpath, planes)
 
     model.to('cpu')
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return video_fpath, mesh_fpath, mesh_glb_fpath, mesh_stl_fpath
+    return video_fpath, mesh_fpath, mesh_glb_fpath
 
 
 import gradio as gr
-
-
-def load_history():
-    history_dir = "history"
-    if not os.path.exists(history_dir):
-        os.makedirs(history_dir)
-        return []
-    
-    try:
-        history_files = [os.path.join(history_dir, f) for f in os.listdir(history_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
-        history_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-        return history_files
-    except OSError:
-        return []
-
-
-
-def load_history():
-    history_dir = "history"
-    if not os.path.exists(history_dir):
-        os.makedirs(history_dir)
-        return []
-    
-    try:
-        history_files = [os.path.join(history_dir, f) for f in os.listdir(history_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
-        history_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-        return history_files
-    except OSError:
-        return []
-
 
 _HEADER_ = '''
 <!--
@@ -324,17 +292,34 @@ with gr.Blocks() as demo:
     gr.Markdown(_HEADER_)
     with gr.Row(variant="panel"):
         with gr.Column(scale=1):
-            gr.Markdown("## Web Browser")
-            with gr.Row():
-                url_input = gr.Textbox(
-                    label="URL",
-                    placeholder="https://www.google.com",
-                    value="https://huggingface.co/spaces/TencentARC/InstantMesh",
-                    interactive=True,
-                    show_label=False,
-                )
-                load_button = gr.Button("Load")
-            browser_html = gr.HTML('<iframe src="https://huggingface.co/spaces/TencentARC/InstantMesh" width="100%" height="700px" style="border:none;"></iframe>')
+            gr.Markdown("## Microsoft Copilot")
+            chatbot = gr.Chatbot(
+                [],
+                elem_id="chatbot",
+                bubble_full_width=False,
+                avatar_images=(None, (os.path.join(os.path.dirname(__file__), "avatar.png"))),
+            )
+            chat_input = gr.Textbox(
+                lines=1,
+                label="Chat input",
+                placeholder="Enter your message",
+                render=False,
+            )
+            chat_input.submit(
+                fn=lambda: gr.update(value=""),
+                outputs=[chat_input],
+                queue=False,
+            ).then(
+                fn=lambda history, message: (history + [[message, None]], ""),
+                inputs=[chatbot, chat_input],
+                outputs=[chatbot, chat_input],
+                queue=True,
+            ).then(
+                fn=lambda history: history + [[None, "This is a mock chatbot. I can't really help you."]],
+                inputs=[chatbot],
+                outputs=[chatbot],
+                queue=True,
+            )
 
         with gr.Column(scale=2):
             with gr.Row():
@@ -428,28 +413,33 @@ with gr.Blocks() as demo:
                         interactive=False,
                     )
                     gr.Markdown("Note: The model shown here has a darker appearance. Download to get correct results.")
-                with gr.Tab("STL"):
-                    output_model_stl = gr.Model3D(
-                        label="Output Model (STL Format)",
-                        #width=768,
-                        interactive=False,
-                    )
 
             with gr.Row():
                 gr.Markdown('''Try a different <b>seed value</b> if the result is unsatisfying (Default: 42).''')
 
     gr.Markdown(_CITE_)
     mv_images = gr.State()
-    image_history = gr.State(value=load_history())
+    image_history = gr.State([])
     selected_index = gr.State(None)
 
-    def load_url(url):
-        if not (url.startswith("http://") or url.startswith("https://")):
-            url = "https://" + url
-        return f'<iframe src="{url}" width="100%" height="700px" style="border:none;"></iframe>'
+    def respond(message, chat_history):
+        if "使い方" in message:
+            bot_message = """
+            1. **画像をアップロード**: 「Input Image」セクションに画像をアップロードまたはドラッグ＆ドロップします。
+            2. **設定を調整**: 必要に応じて、「Remove Background」のチェックを外したり、「Seed Value」や「Sample Steps」を調整します。
+            3. **生成**: 「Generate」ボタンをクリックして、3Dモデルの生成を開始します。
+            4. **結果を確認**: 右側に生成されたマルチビュー画像、ビデオ、3Dモデルが表示されます。
+            5. **履歴**: 生成元の画像は「History」セクションに保存され、選択して削除できます。
+            """
+        elif "こんにちは" in message:
+            bot_message = "こんにちは！何かお手伝いできることはありますか？"
+        else:
+            bot_message = "ごめんなさい、よく分かりません。「使い方を教えて」と聞いてみてください。"
 
-    load_button.click(load_url, inputs=[url_input], outputs=[browser_html])
-    url_input.submit(load_url, inputs=[url_input], outputs=[browser_html])
+        chat_history.append((message, bot_message))
+        return "", chat_history
+
+    chat_input.submit(respond, [chat_input, chatbot], [chat_input, chatbot])
 
     def add_to_history(image, history):
         temp_dir = "history"
@@ -467,13 +457,8 @@ with gr.Blocks() as demo:
         
         return history, gr.update(value=history)
 
-    def on_history_select(evt: gr.SelectData):
-        if evt.value:
-            try:
-                return Image.open(evt.value).convert("RGBA"), evt.index
-            except Exception as e:
-                print(f"Error loading history image: {e}")
-        return gr.update(), gr.update()
+    def select_image(evt: gr.SelectData):
+        return evt.index
 
     def delete_image(history, index):
         if index is not None and 0 <= index < len(history):
@@ -496,7 +481,7 @@ with gr.Blocks() as demo:
     ).success(
         fn=make3d,
         inputs=[mv_images],
-        outputs=[output_video, output_model_obj, output_model_glb, output_model_stl]
+        outputs=[output_video, output_model_obj, output_model_glb]
     ).success(
         fn=add_to_history,
         inputs=[processed_image, image_history],
@@ -504,8 +489,8 @@ with gr.Blocks() as demo:
     )
 
     history_gallery.select(
-        fn=on_history_select,
-        outputs=[input_image, selected_index],
+        fn=select_image,
+        outputs=[selected_index],
         show_progress=False
     )
     delete_button.click(
@@ -513,19 +498,6 @@ with gr.Blocks() as demo:
         inputs=[image_history, selected_index],
         outputs=[image_history, history_gallery, selected_index],
     )
-
-    def update_history_gallery(history):
-        return gr.update(value=history)
-
-    demo.load(
-        fn=lambda: load_history(),
-        outputs=[image_history]
-    ).then(
-        fn=update_history_gallery,
-        inputs=[image_history],
-        outputs=[history_gallery]
-    )
-
 
 demo.queue(max_size=10)
 demo.launch(server_name="0.0.0.0", server_port=43839)

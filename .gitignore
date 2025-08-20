@@ -41,3 +41,4 @@ figures*/
 *.sh
 blender/
 .restore/
+history/

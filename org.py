@@ -18,12 +18,11 @@ from src.utils.camera_util import (
     get_zero123plus_input_cameras,
     get_circular_camera_poses,
 )
-from src.utils.mesh_util import save_obj, save_glb, save_stl
+from src.utils.mesh_util import save_obj, save_glb
 from src.utils.infer_util import remove_background, resize_foreground, images_to_video
 
 import tempfile
 from huggingface_hub import hf_hub_download
-import datetime
 
 
 if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
@@ -100,7 +99,7 @@ unet_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="dif
 state_dict = torch.load(unet_ckpt_path, map_location='cpu')
 pipeline.unet.load_state_dict(state_dict, strict=True)
 
-
+pipeline = pipeline.to(device0)
 
 # load reconstruction model
 print('Loading reconstruction model ...')
@@ -114,7 +113,6 @@ model = model.to(device1)
 if IS_FLEXICUBES:
     model.init_flexicubes_geometry(device1, fovy=30.0)
 model = model.eval()
-model.to('cpu')
 
 print('Loading Finished!')
 
@@ -138,7 +136,6 @@ def generate_mvs(input_image, sample_steps, sample_seed):
 
     seed_everything(sample_seed)
     
-    pipeline.to(device0)
     # sampling
     generator = torch.Generator(device=device0)
     z123_image = pipeline(
@@ -146,9 +143,6 @@ def generate_mvs(input_image, sample_steps, sample_seed):
         num_inference_steps=sample_steps, 
         generator=generator,
     ).images[0]
-    pipeline.to('cpu')
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     show_image = np.asarray(z123_image, dtype=np.uint8)
     show_image_copy = show_image.copy()
@@ -165,7 +159,6 @@ def make_mesh(mesh_fpath, planes):
     mesh_basename = os.path.basename(mesh_fpath).split('.')[0]
     mesh_dirname = os.path.dirname(mesh_fpath)
     mesh_glb_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.glb")
-    mesh_stl_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.stl")
         
     with torch.no_grad():
         # get mesh
@@ -180,16 +173,14 @@ def make_mesh(mesh_fpath, planes):
         vertices = vertices[:, [1, 2, 0]]
         
         save_glb(vertices, faces, vertex_colors, mesh_glb_fpath)
-        save_stl(vertices, faces, mesh_stl_fpath)
         save_obj(vertices, faces, vertex_colors, mesh_fpath)
         
         print(f"Mesh saved to {mesh_fpath}")
 
-    return mesh_fpath, mesh_glb_fpath, mesh_stl_fpath
+    return mesh_fpath, mesh_glb_fpath
 
 
 def make3d(images):
-    model.to(device1)
 
     images = np.asarray(images, dtype=np.float32) / 255.0
     images = torch.from_numpy(images).permute(2, 0, 1).contiguous().float()     # (3, 960, 640)
@@ -241,53 +232,17 @@ def make3d(images):
 
         print(f"Video saved to {video_fpath}")
 
-    mesh_fpath, mesh_glb_fpath, mesh_stl_fpath = make_mesh(mesh_fpath, planes)
+    mesh_fpath, mesh_glb_fpath = make_mesh(mesh_fpath, planes)
 
-    model.to('cpu')
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return video_fpath, mesh_fpath, mesh_glb_fpath, mesh_stl_fpath
+    return video_fpath, mesh_fpath, mesh_glb_fpath
 
 
 import gradio as gr
 
-
-def load_history():
-    history_dir = "history"
-    if not os.path.exists(history_dir):
-        os.makedirs(history_dir)
-        return []
-    
-    try:
-        history_files = [os.path.join(history_dir, f) for f in os.listdir(history_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
-        history_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-        return history_files
-    except OSError:
-        return []
-
-
-
-def load_history():
-    history_dir = "history"
-    if not os.path.exists(history_dir):
-        os.makedirs(history_dir)
-        return []
-    
-    try:
-        history_files = [os.path.join(history_dir, f) for f in os.listdir(history_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
-        history_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-        return history_files
-    except OSError:
-        return []
-
-
 _HEADER_ = '''
-<!--
 <h2><b>Official 🤗 Gradio Demo</b></h2><h2><a href='https://github.com/TencentARC/InstantMesh' target='_blank'><b>InstantMesh: Efficient 3D Mesh Generation from a Single Image with Sparse-view Large Reconstruction Models</b></a></h2>
 
 **InstantMesh** is a feed-forward framework for efficient 3D mesh generation from a single image based on the LRM/Instant3D architecture.
--->
 
 Code: <a href='https://github.com/TencentARC/InstantMesh' target='_blank'>GitHub</a>. Techenical report: <a href='https://arxiv.org/abs/2404.07191' target='_blank'>ArXiv</a>.
 
@@ -323,20 +278,7 @@ If you have any questions, feel free to open a discussion or contact us at <b>bl
 with gr.Blocks() as demo:
     gr.Markdown(_HEADER_)
     with gr.Row(variant="panel"):
-        with gr.Column(scale=1):
-            gr.Markdown("## Web Browser")
-            with gr.Row():
-                url_input = gr.Textbox(
-                    label="URL",
-                    placeholder="https://www.google.com",
-                    value="https://huggingface.co/spaces/TencentARC/InstantMesh",
-                    interactive=True,
-                    show_label=False,
-                )
-                load_button = gr.Button("Load")
-            browser_html = gr.HTML('<iframe src="https://huggingface.co/spaces/TencentARC/InstantMesh" width="100%" height="700px" style="border:none;"></iframe>')
-
-        with gr.Column(scale=2):
+        with gr.Column():
             with gr.Row():
                 input_image = gr.Image(
                     label="Input Image",
@@ -373,27 +315,17 @@ with gr.Blocks() as demo:
             with gr.Row():
                 submit = gr.Button("Generate", elem_id="generate", variant="primary")
 
-            with gr.Accordion("Examples", open=False):
+            with gr.Row(variant="panel"):
                 gr.Examples(
                     examples=[
                         os.path.join("examples", img_name) for img_name in sorted(os.listdir("examples"))
                     ],
                     inputs=[input_image],
+                    label="Examples",
                     examples_per_page=20
                 )
 
-            with gr.Accordion("History", open=True):
-                history_gallery = gr.Gallery(
-                    label="Generation History",
-                    show_label=False,
-                    elem_id="history_gallery",
-                    columns=4,
-                    height="auto",
-                    object_fit="contain",
-                )
-                delete_button = gr.Button("Delete Selected Image")
-
-        with gr.Column(scale=2):
+        with gr.Column():
 
             with gr.Row():
 
@@ -428,62 +360,12 @@ with gr.Blocks() as demo:
                         interactive=False,
                     )
                     gr.Markdown("Note: The model shown here has a darker appearance. Download to get correct results.")
-                with gr.Tab("STL"):
-                    output_model_stl = gr.Model3D(
-                        label="Output Model (STL Format)",
-                        #width=768,
-                        interactive=False,
-                    )
 
             with gr.Row():
                 gr.Markdown('''Try a different <b>seed value</b> if the result is unsatisfying (Default: 42).''')
 
     gr.Markdown(_CITE_)
     mv_images = gr.State()
-    image_history = gr.State(value=load_history())
-    selected_index = gr.State(None)
-
-    def load_url(url):
-        if not (url.startswith("http://") or url.startswith("https://")):
-            url = "https://" + url
-        return f'<iframe src="{url}" width="100%" height="700px" style="border:none;"></iframe>'
-
-    load_button.click(load_url, inputs=[url_input], outputs=[browser_html])
-    url_input.submit(load_url, inputs=[url_input], outputs=[browser_html])
-
-    def add_to_history(image, history):
-        temp_dir = "history"
-        if not os.path.exists(temp_dir):
-            os.makedirs(temp_dir)
-        
-        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        filename = os.path.join(temp_dir, f"{timestamp}.png")
-        if image is not None:
-            try:
-                image.save(filename)
-                history.insert(0, filename) # Add to the beginning
-            except Exception as e:
-                print(f"Failed to save history image: {e}")
-        
-        return history, gr.update(value=history)
-
-    def on_history_select(evt: gr.SelectData):
-        if evt.value:
-            try:
-                return Image.open(evt.value).convert("RGBA"), evt.index
-            except Exception as e:
-                print(f"Error loading history image: {e}")
-        return gr.update(), gr.update()
-
-    def delete_image(history, index):
-        if index is not None and 0 <= index < len(history):
-            filepath = history.pop(index)
-            if os.path.exists(filepath):
-                try:
-                    os.remove(filepath)
-                except Exception as e:
-                    print(f"Failed to delete history image: {e}")
-        return history, gr.update(value=history), None
 
     submit.click(fn=check_input_image, inputs=[input_image]).success(
         fn=preprocess,
@@ -496,36 +378,8 @@ with gr.Blocks() as demo:
     ).success(
         fn=make3d,
         inputs=[mv_images],
-        outputs=[output_video, output_model_obj, output_model_glb, output_model_stl]
-    ).success(
-        fn=add_to_history,
-        inputs=[processed_image, image_history],
-        outputs=[image_history, history_gallery]
+        outputs=[output_video, output_model_obj, output_model_glb]
     )
-
-    history_gallery.select(
-        fn=on_history_select,
-        outputs=[input_image, selected_index],
-        show_progress=False
-    )
-    delete_button.click(
-        fn=delete_image,
-        inputs=[image_history, selected_index],
-        outputs=[image_history, history_gallery, selected_index],
-    )
-
-    def update_history_gallery(history):
-        return gr.update(value=history)
-
-    demo.load(
-        fn=lambda: load_history(),
-        outputs=[image_history]
-    ).then(
-        fn=update_history_gallery,
-        inputs=[image_history],
-        outputs=[history_gallery]
-    )
-
 
 demo.queue(max_size=10)
 demo.launch(server_name="0.0.0.0", server_port=43839)

@@ -179,3 +179,16 @@ def xatlas_uvmap(ctx, mesh_v, mesh_pos_idx, resolution):
     gb_pos, _ = interpolate(mesh_v[None, ...], rast, mesh_pos_idx.int())
     mask = rast[..., 3:4] > 0
     return uvs, mesh_tex_idx, gb_pos, mask
+
+
+def save_stl(pointnp_px3, facenp_fx3, fpath):
+
+    # Follow the same transformation as save_obj for consistency
+    pointnp_px3 = pointnp_px3 @ np.array([[1, 0, 0], [0, 1, 0], [0, 0, -1]])
+    facenp_fx3 = facenp_fx3[:, [2, 1, 0]]
+
+    mesh = trimesh.Trimesh(
+        vertices=pointnp_px3, 
+        faces=facenp_fx3,
+    )
+    mesh.export(fpath, 'stl')
