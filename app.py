@@ -323,18 +323,7 @@ If you have any questions, feel free to open a discussion or contact us at <b>bl
 with gr.Blocks() as demo:
     gr.Markdown(_HEADER_)
     with gr.Row(variant="panel"):
-        with gr.Column(scale=1):
-            gr.Markdown("## Web Browser")
-            with gr.Row():
-                url_input = gr.Textbox(
-                    label="URL",
-                    placeholder="https://www.google.com",
-                    value="https://huggingface.co/spaces/TencentARC/InstantMesh",
-                    interactive=True,
-                    show_label=False,
-                )
-                load_button = gr.Button("Load")
-            browser_html = gr.HTML('<iframe src="https://huggingface.co/spaces/TencentARC/InstantMesh" width="100%" height="700px" style="border:none;"></iframe>')
+
 
         with gr.Column(scale=2):
             with gr.Row():
@@ -443,13 +432,7 @@ with gr.Blocks() as demo:
     image_history = gr.State(value=load_history())
     selected_index = gr.State(None)
 
-    def load_url(url):
-        if not (url.startswith("http://") or url.startswith("https://")):
-            url = "https://" + url
-        return f'<iframe src="{url}" width="100%" height="700px" style="border:none;"></iframe>'
 
-    load_button.click(load_url, inputs=[url_input], outputs=[browser_html])
-    url_input.submit(load_url, inputs=[url_input], outputs=[browser_html])
 
     def add_to_history(image, history):
         temp_dir = "history"
