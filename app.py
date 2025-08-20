@@ -18,12 +18,16 @@ from src.utils.camera_util import (
     get_zero123plus_input_cameras,
     get_circular_camera_poses,
 )
-from src.utils.mesh_util import save_obj, save_glb, save_stl
+from src.utils.mesh_util import save_obj, save_glb, save_stl, save_obj_with_mtl
 from src.utils.infer_util import remove_background, resize_foreground, images_to_video
 
 import tempfile
 from huggingface_hub import hf_hub_download
 import datetime
+import gc
+import shutil
+import shutil
+import glob
 
 
 if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
@@ -81,14 +85,11 @@ infer_config = config.infer_config
 
 IS_FLEXICUBES = True if config_name.startswith('instant-mesh') else False
 
-device = torch.device('cuda')
-
 # load diffusion model
 print('Loading diffusion model ...')
 pipeline = DiffusionPipeline.from_pretrained(
     "sudo-ai/zero123plus-v1.2", 
     custom_pipeline="zero123plus",
-    torch_dtype=torch.float16,
     cache_dir=model_cache_dir
 )
 pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
@@ -99,7 +100,7 @@ pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
 unet_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="diffusion_pytorch_model.bin", repo_type="model", cache_dir=model_cache_dir)
 state_dict = torch.load(unet_ckpt_path, map_location='cpu')
 pipeline.unet.load_state_dict(state_dict, strict=True)
-
+pipeline.to('cpu')
 
 
 # load reconstruction model
@@ -146,9 +147,12 @@ def generate_mvs(input_image, sample_steps, sample_seed):
         num_inference_steps=sample_steps, 
         generator=generator,
     ).images[0]
+    
     pipeline.to('cpu')
+    del generator
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        gc.collect()
 
     show_image = np.asarray(z123_image, dtype=np.uint8)
     show_image_copy = show_image.copy()
@@ -160,35 +164,59 @@ def generate_mvs(input_image, sample_steps, sample_seed):
     return z123_image, show_image
 
 
-def make_mesh(mesh_fpath, planes):
+def make_mesh(mesh_fpath, planes, export_texmap):
 
     mesh_basename = os.path.basename(mesh_fpath).split('.')[0]
     mesh_dirname = os.path.dirname(mesh_fpath)
-    mesh_glb_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.glb")
-    mesh_stl_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.stl")
-        
+    
     with torch.no_grad():
-        # get mesh
-
         mesh_out = model.extract_mesh(
             planes,
-            use_texture_map=False,
+            use_texture_map=export_texmap,
             **infer_config,
         )
 
-        vertices, faces, vertex_colors = mesh_out
-        vertices = vertices[:, [1, 2, 0]]
-        
-        save_glb(vertices, faces, vertex_colors, mesh_glb_fpath)
-        save_stl(vertices, faces, mesh_stl_fpath)
-        save_obj(vertices, faces, vertex_colors, mesh_fpath)
-        
-        print(f"Mesh saved to {mesh_fpath}")
+        if export_texmap:
+            vertices, faces, uvs, mesh_tex_idx, tex_map = mesh_out
+            
+            # Apply the same coordinate transformation as the other branch
+            vertices_transformed = vertices[:, [1, 2, 0]]
 
-    return mesh_fpath, mesh_glb_fpath, mesh_stl_fpath
+            # Save OBJ with texture map using transformed vertices
+            save_obj_with_mtl(
+                vertices_transformed.data.cpu().numpy(),
+                uvs.data.cpu().numpy(),
+                faces.data.cpu().numpy(),
+                mesh_tex_idx.data.cpu().numpy(),
+                tex_map.permute(1, 2, 0).data.cpu().numpy(),
+                mesh_fpath,
+            )
+            print(f"Mesh with texture map saved to {mesh_fpath}")
+
+                        # Also save GLB and STL versions (without texture information)
+            mesh_glb_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.glb")
+            mesh_stl_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.stl")
+            
+            save_glb(vertices_transformed.cpu(), faces.cpu(), None, mesh_glb_fpath)
+            save_stl(vertices_transformed.cpu(), faces.cpu(), mesh_stl_fpath)
+            
+            return mesh_fpath, mesh_glb_fpath, mesh_stl_fpath
+        else:
+            mesh_glb_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.glb")
+            mesh_stl_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.stl")
+            
+            vertices, faces, vertex_colors = mesh_out
+            vertices = vertices[:, [1, 2, 0]]
+            
+            save_glb(vertices, faces, vertex_colors, mesh_glb_fpath)
+            save_stl(vertices, faces, mesh_stl_fpath)
+            save_obj(vertices, faces, vertex_colors, mesh_fpath)
+            
+            print(f"Mesh saved to {mesh_fpath}")
+            return mesh_fpath, mesh_glb_fpath, mesh_stl_fpath
 
 
-def make3d(images):
+def make3d(images, export_texmap):
     model.to(device1)
 
     images = np.asarray(images, dtype=np.float32) / 255.0
@@ -202,11 +230,11 @@ def make3d(images):
     images = images.unsqueeze(0).to(device1)
     images = v2.functional.resize(images, (320, 320), interpolation=3, antialias=True).clamp(0, 1)
 
-    mesh_fpath = tempfile.NamedTemporaryFile(suffix=f".obj", delete=False).name
-    print(mesh_fpath)
-    mesh_basename = os.path.basename(mesh_fpath).split('.')[0]
-    mesh_dirname = os.path.dirname(mesh_fpath)
-    video_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.mp4")
+    # Create a temporary directory for all output files
+    temp_dir = tempfile.mkdtemp()
+    mesh_fpath = os.path.join(temp_dir, "mesh.obj")
+    # The video path should also be in the temporary directory
+    video_fpath = os.path.join(temp_dir, "video.mp4")
 
     with torch.no_grad():
         # get triplane
@@ -241,13 +269,16 @@ def make3d(images):
 
         print(f"Video saved to {video_fpath}")
 
-    mesh_fpath, mesh_glb_fpath, mesh_stl_fpath = make_mesh(mesh_fpath, planes)
+    mesh_fpath, mesh_glb_fpath, mesh_stl_fpath = make_mesh(mesh_fpath, planes, export_texmap)
 
     model.to('cpu')
+    del images, input_cameras, render_cameras, planes, frames
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        gc.collect()
 
-    return video_fpath, mesh_fpath, mesh_glb_fpath, mesh_stl_fpath
+    # Return the temporary directory path as well
+    return video_fpath, mesh_fpath, mesh_glb_fpath, mesh_stl_fpath, temp_dir
 
 
 import gradio as gr
@@ -260,23 +291,12 @@ def load_history():
         return []
     
     try:
-        history_files = [os.path.join(history_dir, f) for f in os.listdir(history_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
-        history_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-        return history_files
-    except OSError:
-        return []
-
-
-
-def load_history():
-    history_dir = "history"
-    if not os.path.exists(history_dir):
-        os.makedirs(history_dir)
-        return []
-    
-    try:
-        history_files = [os.path.join(history_dir, f) for f in os.listdir(history_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
-        history_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        # Get all subdirectories in the history folder
+        subdirs = [os.path.join(history_dir, d) for d in os.listdir(history_dir) if os.path.isdir(os.path.join(history_dir, d))]
+        # Sort by modification time
+        subdirs.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        # Get the preview.png from each subdirectory
+        history_files = [os.path.join(d, 'preview.png') for d in subdirs if os.path.exists(os.path.join(d, 'preview.png'))]
         return history_files
     except OSError:
         return []
@@ -323,178 +343,217 @@ If you have any questions, feel free to open a discussion or contact us at <b>bl
 with gr.Blocks() as demo:
     gr.Markdown(_HEADER_)
     with gr.Row(variant="panel"):
-
-
         with gr.Column(scale=2):
             with gr.Row():
                 input_image = gr.Image(
                     label="Input Image",
                     image_mode="RGBA",
-                    sources="upload",
+                    sources=["upload"],
                     width=256,
                     height=256,
                     type="pil",
-                    elem_id="content_image",
                 )
                 processed_image = gr.Image(
                     label="Processed Image", 
                     image_mode="RGBA", 
                     width=256,
                     height=256,
-                    type="pil", 
-                    interactive=False
+                    type="pil",
                 )
-            with gr.Row():
-                with gr.Group():
-                    do_remove_background = gr.Checkbox(
-                        label="Remove Background", value=True
-                    )
-                    sample_seed = gr.Number(value=42, label="Seed Value", precision=0)
-
-                    sample_steps = gr.Slider(
-                        label="Sample Steps",
-                        minimum=30,
-                        maximum=75,
-                        value=75,
-                        step=5
-                    )
-
-            with gr.Row():
-                submit = gr.Button("Generate", elem_id="generate", variant="primary")
-
+            with gr.Group():
+                do_remove_background = gr.Checkbox(
+                    label="Remove Background", value=True
+                )
+                export_texmap = gr.Checkbox(
+                    label="Export Texture Map", value=False
+                )
+                sample_seed = gr.Number(value=42, label="Seed Value", precision=0)
+                sample_steps = gr.Slider(
+                    label="Sample Steps",
+                    minimum=30,
+                    maximum=75,
+                    value=75,
+                    step=5
+                )
+            submit = gr.Button("Generate", variant="primary")
             with gr.Accordion("Examples", open=False):
                 gr.Examples(
                     examples=[
                         os.path.join("examples", img_name) for img_name in sorted(os.listdir("examples"))
                     ],
-                    inputs=[input_image],
+                    inputs=input_image,
                     examples_per_page=20
                 )
-
             with gr.Accordion("History", open=True):
+                delete_button = gr.Button("Delete Selected Image")
                 history_gallery = gr.Gallery(
                     label="Generation History",
                     show_label=False,
-                    elem_id="history_gallery",
                     columns=4,
                     height="auto",
                     object_fit="contain",
                 )
-                delete_button = gr.Button("Delete Selected Image")
+                with gr.Row(visible=False) as history_download_row:
+                    history_obj_download = gr.File(label="Download OBJ", interactive=False)
+                    history_glb_download = gr.File(label="Download GLB", interactive=False)
+                    history_stl_download = gr.File(label="Download STL", interactive=False)
 
         with gr.Column(scale=2):
-
-            with gr.Row():
-
-                with gr.Column():
-                    mv_show_images = gr.Image(
-                        label="Generated Multi-views",
-                        type="pil",
-                        width=379,
-                        interactive=False
-                    )
-
-                with gr.Column():
-                    output_video = gr.Video(
-                        label="video", format="mp4",
-                        width=379,
-                        autoplay=True,
-                        interactive=False
-                    )
-
-            with gr.Row():
+            mv_show_images = gr.Image(
+                label="Generated Multi-views",
+                type="pil",
+                width=379,
+            )
+            output_video = gr.Video(
+                label="video", format="mp4",
+                width=379,
+                autoplay=True,
+            )
+            with gr.Tabs():
                 with gr.Tab("OBJ"):
                     output_model_obj = gr.Model3D(
                         label="Output Model (OBJ Format)",
-                        #width=768,
-                        interactive=False,
                     )
                     gr.Markdown("Note: Downloaded .obj model will be flipped. Export .glb instead or manually flip it before usage.")
                 with gr.Tab("GLB"):
                     output_model_glb = gr.Model3D(
                         label="Output Model (GLB Format)",
-                        #width=768,
-                        interactive=False,
                     )
                     gr.Markdown("Note: The model shown here has a darker appearance. Download to get correct results.")
                 with gr.Tab("STL"):
                     output_model_stl = gr.Model3D(
                         label="Output Model (STL Format)",
-                        #width=768,
-                        interactive=False,
                     )
-
-            with gr.Row():
-                gr.Markdown('''Try a different <b>seed value</b> if the result is unsatisfying (Default: 42).''')
+            gr.Markdown('''Try a different <b>seed value</b> if the result is unsatisfying (Default: 42).''')
 
     gr.Markdown(_CITE_)
     mv_images = gr.State()
+    temp_dir_state = gr.State() # To store the temporary directory path
     image_history = gr.State(value=load_history())
-    selected_index = gr.State(None)
+    selected_index = gr.State()
 
+    def add_to_history(image, temp_dir, history):
+        if not temp_dir or not os.path.isdir(temp_dir):
+            print(f"Invalid temporary directory: {temp_dir}")
+            return history, gr.update(value=history)
 
-
-    def add_to_history(image, history):
-        temp_dir = "history"
-        if not os.path.exists(temp_dir):
-            os.makedirs(temp_dir)
+        history_root = "history"
+        os.makedirs(history_root, exist_ok=True)
         
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        filename = os.path.join(temp_dir, f"{timestamp}.png")
+        new_history_dir = os.path.join(history_root, timestamp)
+        os.makedirs(new_history_dir, exist_ok=True)
+
+        # Save the preview image
+        preview_path = os.path.join(new_history_dir, "preview.png")
         if image is not None:
             try:
-                image.save(filename)
-                history.insert(0, filename) # Add to the beginning
+                image.save(preview_path)
+                history.insert(0, preview_path) # Add to the beginning
             except Exception as e:
                 print(f"Failed to save history image: {e}")
         
+        # Move all files from temp_dir to the new history directory
+        for filename in os.listdir(temp_dir):
+            shutil.move(os.path.join(temp_dir, filename), new_history_dir)
+        
+        # Clean up the now-empty temporary directory
+        try:
+            os.rmdir(temp_dir)
+        except OSError as e:
+            print(f"Error removing temporary directory {temp_dir}: {e}")
+
         return history, gr.update(value=history)
 
-    def on_history_select(evt: gr.SelectData):
-        if evt.value:
-            try:
-                return Image.open(evt.value).convert("RGBA"), evt.index
-            except Exception as e:
-                print(f"Error loading history image: {e}")
-        return gr.update(), gr.update()
+    def on_history_select(evt: gr.SelectData, history: list):
+        if evt.index is None or not history:
+            return gr.update(), gr.update(), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+        
+        try:
+            # Use the index to get the correct path from our state, not the temp path from the event value
+            image_path = history[evt.index]
+
+            if os.path.exists(image_path):
+                # The history item is the preview.png, its parent is the directory
+                history_item_dir = os.path.dirname(image_path)
+                
+                obj_path = glob.glob(os.path.join(history_item_dir, "*.obj"))
+                glb_path = glob.glob(os.path.join(history_item_dir, "*.glb"))
+                stl_path = glob.glob(os.path.join(history_item_dir, "*.stl"))
+
+                # Make the download row and buttons visible
+                return (
+                    Image.open(image_path).convert("RGBA"), 
+                    evt.index,
+                    gr.update(visible=True),
+                    gr.update(value=obj_path[0] if obj_path else None, visible=bool(obj_path)),
+                    gr.update(value=glb_path[0] if glb_path else None, visible=bool(glb_path)),
+                    gr.update(value=stl_path[0] if stl_path else None, visible=bool(stl_path)),
+                )
+        except Exception as e:
+            print(f"Error loading history item: {e}")
+        
+        # Fallback if something goes wrong
+        return gr.update(), gr.update(), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+
 
     def delete_image(history, index):
         if index is not None and 0 <= index < len(history):
-            filepath = history.pop(index)
-            if os.path.exists(filepath):
+            item_to_remove = history.pop(index)
+            # item_to_remove is the path to preview.png
+            history_item_dir = os.path.dirname(item_to_remove)
+            if os.path.isdir(history_item_dir):
                 try:
-                    os.remove(filepath)
+                    shutil.rmtree(history_item_dir)
+                    print(f"Deleted history directory: {history_item_dir}")
                 except Exception as e:
-                    print(f"Failed to delete history image: {e}")
-        return history, gr.update(value=history), None
+                    print(f"Failed to delete history directory: {e}")
+        # Hide download buttons after deletion
+        return history, gr.update(value=history), None, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
 
-    submit.click(fn=check_input_image, inputs=[input_image]).success(
+    submit.click(fn=check_input_image, inputs=[input_image]).then(
         fn=preprocess,
         inputs=[input_image, do_remove_background],
         outputs=[processed_image],
-    ).success(
+    ).then(
         fn=generate_mvs,
         inputs=[processed_image, sample_steps, sample_seed],
         outputs=[mv_images, mv_show_images],
-    ).success(
+    ).then(
         fn=make3d,
-        inputs=[mv_images],
-        outputs=[output_video, output_model_obj, output_model_glb, output_model_stl]
-    ).success(
+        inputs=[mv_images, export_texmap],
+        outputs=[output_video, output_model_obj, output_model_glb, output_model_stl, temp_dir_state]
+    ).then(
         fn=add_to_history,
-        inputs=[processed_image, image_history],
+        inputs=[processed_image, temp_dir_state, image_history],
         outputs=[image_history, history_gallery]
     )
 
     history_gallery.select(
         fn=on_history_select,
-        outputs=[input_image, selected_index],
+        inputs=[image_history],
+        outputs=[
+            input_image, 
+            selected_index, 
+            history_download_row,
+            history_obj_download,
+            history_glb_download,
+            history_stl_download
+        ],
         show_progress=False
     )
     delete_button.click(
         fn=delete_image,
         inputs=[image_history, selected_index],
-        outputs=[image_history, history_gallery, selected_index],
+        outputs=[
+            image_history, 
+            history_gallery, 
+            selected_index,
+            history_download_row,
+            history_obj_download,
+            history_glb_download,
+            history_stl_download
+        ],
     )
 
     def update_history_gallery(history):
