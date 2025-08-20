@@ -359,6 +359,7 @@ with gr.Blocks() as demo:
                     width=256,
                     height=256,
                     type="pil",
+                    interactive=False, 
                 )
             with gr.Group():
                 do_remove_background = gr.Checkbox(
