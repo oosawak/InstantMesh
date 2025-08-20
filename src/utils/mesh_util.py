@@ -44,6 +44,7 @@ def save_obj_with_mtl(pointnp_px3, tcoords_px2, facenp_fx3, facetex_fx3, texmap_
     import os
     fol, na = os.path.split(fname)
     na, _ = os.path.splitext(na)
+    texture_filename = f"{na}_albedo.png"
 
     matname = '%s/%s.mtl' % (fol, na)
     fid = open(matname, 'w')
@@ -53,7 +54,7 @@ def save_obj_with_mtl(pointnp_px3, tcoords_px2, facenp_fx3, facetex_fx3, texmap_
     fid.write('Ks 0.4 0.4 0.4\n')
     fid.write('Ns 10\n')
     fid.write('illum 2\n')
-    fid.write('map_Kd %s.png\n' % na)
+    fid.write(f'map_Kd {texture_filename}\n')
     fid.close()
     ####
 
@@ -86,7 +87,7 @@ def save_obj_with_mtl(pointnp_px3, tcoords_px2, facenp_fx3, facetex_fx3, texmap_
     dilate_img = cv2.dilate(img, kernel, iterations=1)
     img = img * (1 - mask) + dilate_img * mask
     img = img.clip(0, 255).astype(np.uint8)
-    Image.fromarray(np.ascontiguousarray(img[::-1, :, :]), 'RGB').save(f'{fol}/{na}.png')
+    Image.fromarray(np.ascontiguousarray(img[::-1, :, :]), 'RGB').save(os.path.join(fol, texture_filename))
 
 
 def loadobj(meshfile):

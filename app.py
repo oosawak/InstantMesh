@@ -26,8 +26,14 @@ from huggingface_hub import hf_hub_download
 import datetime
 import gc
 import shutil
-import shutil
 import glob
+import time
+import psutil
+try:
+    from pynvml import *
+except ImportError:
+    # This will happen if pynvml is not installed, which is fine if there's no NVIDIA GPU
+    pass
 
 
 if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
@@ -169,11 +175,15 @@ def make_mesh(mesh_fpath, planes, export_texmap):
     mesh_basename = os.path.basename(mesh_fpath).split('.')[0]
     mesh_dirname = os.path.dirname(mesh_fpath)
     
+    # Lower the resolution to reduce memory usage
+    local_infer_config = infer_config.copy()
+    local_infer_config['mc_res'] = 192
+
     with torch.no_grad():
         mesh_out = model.extract_mesh(
             planes,
             use_texture_map=export_texmap,
-            **infer_config,
+            **local_infer_config,
         )
 
         if export_texmap:
@@ -193,14 +203,23 @@ def make_mesh(mesh_fpath, planes, export_texmap):
             )
             print(f"Mesh with texture map saved to {mesh_fpath}")
 
-                        # Also save GLB and STL versions (without texture information)
+            # Also save GLB and STL versions (without texture information)
             mesh_glb_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.glb")
             mesh_stl_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.stl")
             
             save_glb(vertices_transformed.cpu(), faces.cpu(), None, mesh_glb_fpath)
             save_stl(vertices_transformed.cpu(), faces.cpu(), mesh_stl_fpath)
+
+            # Get texture file paths
+            mtl_fpath = mesh_fpath.replace('.obj', '.mtl')
+            texture_fpaths = glob.glob(os.path.join(mesh_dirname, '*_albedo.png'))
+            if texture_fpaths:
+                texture_fpath = texture_fpaths[0]
+            else:
+                texture_fpath = None
+                print("Warning: Albedo texture file not found.")
             
-            return mesh_fpath, mesh_glb_fpath, mesh_stl_fpath
+            return mesh_fpath, mesh_glb_fpath, mesh_stl_fpath, mtl_fpath, texture_fpath
         else:
             mesh_glb_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.glb")
             mesh_stl_fpath = os.path.join(mesh_dirname, f"{mesh_basename}.stl")
@@ -213,7 +232,7 @@ def make_mesh(mesh_fpath, planes, export_texmap):
             save_obj(vertices, faces, vertex_colors, mesh_fpath)
             
             print(f"Mesh saved to {mesh_fpath}")
-            return mesh_fpath, mesh_glb_fpath, mesh_stl_fpath
+            return mesh_fpath, mesh_glb_fpath, mesh_stl_fpath, None, None
 
 
 def make3d(images, export_texmap):
@@ -269,7 +288,11 @@ def make3d(images, export_texmap):
 
         print(f"Video saved to {video_fpath}")
 
-    mesh_fpath, mesh_glb_fpath, mesh_stl_fpath = make_mesh(mesh_fpath, planes, export_texmap)
+    mtl_fpath, texture_fpath = None, None
+    if export_texmap:
+        mesh_fpath, mesh_glb_fpath, mesh_stl_fpath, mtl_fpath, texture_fpath = make_mesh(mesh_fpath, planes, export_texmap)
+    else:
+        mesh_fpath, mesh_glb_fpath, mesh_stl_fpath, _, _ = make_mesh(mesh_fpath, planes, export_texmap)
 
     model.to('cpu')
     del images, input_cameras, render_cameras, planes, frames
@@ -278,7 +301,7 @@ def make3d(images, export_texmap):
         gc.collect()
 
     # Return the temporary directory path as well
-    return video_fpath, mesh_fpath, mesh_glb_fpath, mesh_stl_fpath, temp_dir
+    return video_fpath, mesh_fpath, mesh_glb_fpath, mesh_stl_fpath, temp_dir, mtl_fpath, texture_fpath
 
 
 import gradio as gr
@@ -334,14 +357,16 @@ If you find our work useful for your research or applications, please cite using
 📋 **License**
 
 Apache-2.0 LICENSE. Please refer to the [LICENSE file](https://huggingface.co/spaces/TencentARC/InstantMesh/blob/main/LICENSE) for details.
-
+<!--
 📧 **Contact**
 
 If you have any questions, feel free to open a discussion or contact us at <b>bluestyle928@gmail.com</b>.
+-->
 """
 
 with gr.Blocks() as demo:
     gr.Markdown(_HEADER_)
+    memory_stats = gr.Textbox(label="Memory Usage", interactive=False)
     with gr.Row(variant="panel"):
         with gr.Column(scale=2):
             with gr.Row():
@@ -398,6 +423,8 @@ with gr.Blocks() as demo:
                     history_obj_download = gr.File(label="Download OBJ", interactive=False)
                     history_glb_download = gr.File(label="Download GLB", interactive=False)
                     history_stl_download = gr.File(label="Download STL", interactive=False)
+                    history_mtl_download = gr.File(label="Download MTL", interactive=False)
+                    history_png_download = gr.File(label="Download Texture", interactive=False)
 
         with gr.Column(scale=2):
             mv_show_images = gr.Image(
@@ -425,6 +452,9 @@ with gr.Blocks() as demo:
                     output_model_stl = gr.Model3D(
                         label="Output Model (STL Format)",
                     )
+            with gr.Row(visible=False) as download_row:
+                output_mtl = gr.File(label="Download MTL", interactive=False)
+                output_png = gr.File(label="Download Texture", interactive=False)
             gr.Markdown('''Try a different <b>seed value</b> if the result is unsatisfying (Default: 42).''')
 
     gr.Markdown(_CITE_)
@@ -432,6 +462,8 @@ with gr.Blocks() as demo:
     temp_dir_state = gr.State() # To store the temporary directory path
     image_history = gr.State(value=load_history())
     selected_index = gr.State()
+    mtl_fpath_state = gr.State()
+    png_fpath_state = gr.State()
 
     def add_to_history(image, temp_dir, history):
         if not temp_dir or not os.path.isdir(temp_dir):
@@ -454,9 +486,19 @@ with gr.Blocks() as demo:
             except Exception as e:
                 print(f"Failed to save history image: {e}")
         
-        # Move all files from temp_dir to the new history directory
+        # Move and rename all files from temp_dir to the new history directory
         for filename in os.listdir(temp_dir):
-            shutil.move(os.path.join(temp_dir, filename), new_history_dir)
+            original_path = os.path.join(temp_dir, filename)
+            
+            # Determine the new filename based on the timestamp
+            file_extension = os.path.splitext(filename)[1]
+            if 'albedo' in filename:
+                new_filename = f"{timestamp}_albedo{file_extension}"
+            else:
+                new_filename = f"{timestamp}{file_extension}"
+                
+            new_path = os.path.join(new_history_dir, new_filename)
+            shutil.move(original_path, new_path)
         
         # Clean up the now-empty temporary directory
         try:
@@ -468,7 +510,7 @@ with gr.Blocks() as demo:
 
     def on_history_select(evt: gr.SelectData, history: list):
         if evt.index is None or not history:
-            return gr.update(), gr.update(), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+            return gr.update(), gr.update(), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
         
         try:
             # Use the index to get the correct path from our state, not the temp path from the event value
@@ -481,6 +523,8 @@ with gr.Blocks() as demo:
                 obj_path = glob.glob(os.path.join(history_item_dir, "*.obj"))
                 glb_path = glob.glob(os.path.join(history_item_dir, "*.glb"))
                 stl_path = glob.glob(os.path.join(history_item_dir, "*.stl"))
+                mtl_path = glob.glob(os.path.join(history_item_dir, "*.mtl"))
+                png_path = glob.glob(os.path.join(history_item_dir, "*_albedo.png"))
 
                 # Make the download row and buttons visible
                 return (
@@ -490,12 +534,14 @@ with gr.Blocks() as demo:
                     gr.update(value=obj_path[0] if obj_path else None, visible=bool(obj_path)),
                     gr.update(value=glb_path[0] if glb_path else None, visible=bool(glb_path)),
                     gr.update(value=stl_path[0] if stl_path else None, visible=bool(stl_path)),
+                    gr.update(value=mtl_path[0] if mtl_path else None, visible=bool(mtl_path)),
+                    gr.update(value=png_path[0] if png_path else None, visible=bool(png_path)),
                 )
         except Exception as e:
             print(f"Error loading history item: {e}")
         
         # Fallback if something goes wrong
-        return gr.update(), gr.update(), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+        return gr.update(), gr.update(), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
 
 
     def delete_image(history, index):
@@ -510,7 +556,7 @@ with gr.Blocks() as demo:
                 except Exception as e:
                     print(f"Failed to delete history directory: {e}")
         # Hide download buttons after deletion
-        return history, gr.update(value=history), None, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+        return history, gr.update(value=history), None, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
 
     submit.click(fn=check_input_image, inputs=[input_image]).then(
         fn=preprocess,
@@ -523,7 +569,7 @@ with gr.Blocks() as demo:
     ).then(
         fn=make3d,
         inputs=[mv_images, export_texmap],
-        outputs=[output_video, output_model_obj, output_model_glb, output_model_stl, temp_dir_state]
+        outputs=[output_video, output_model_obj, output_model_glb, output_model_stl, temp_dir_state, mtl_fpath_state, png_fpath_state]
     ).then(
         fn=add_to_history,
         inputs=[processed_image, temp_dir_state, image_history],
@@ -539,7 +585,9 @@ with gr.Blocks() as demo:
             history_download_row,
             history_obj_download,
             history_glb_download,
-            history_stl_download
+            history_stl_download,
+            history_mtl_download,
+            history_png_download,
         ],
         show_progress=False
     )
@@ -553,21 +601,61 @@ with gr.Blocks() as demo:
             history_download_row,
             history_obj_download,
             history_glb_download,
-            history_stl_download
+            history_stl_download,
+            history_mtl_download,
+            history_png_download,
         ],
     )
 
     def update_history_gallery(history):
         return gr.update(value=history)
 
+    def show_texture_downloads(export_texmap, mtl_fpath, png_fpath):
+        return gr.update(visible=export_texmap), gr.update(value=mtl_fpath, visible=export_texmap), gr.update(value=png_fpath, visible=export_texmap)
+
+    mtl_fpath_state.change(
+        fn=show_texture_downloads,
+        inputs=[export_texmap, mtl_fpath_state, png_fpath_state],
+        outputs=[download_row, output_mtl, output_png]
+    )
+
+    def get_memory_usage():
+        gpu_str = "N/A"
+        try:
+            nvmlInit()
+            gpu_count = nvmlDeviceGetCount()
+            gpu_info = []
+            for i in range(gpu_count):
+                handle = nvmlDeviceGetHandleByIndex(i)
+                mem_info = nvmlDeviceGetMemoryInfo(handle)
+                gpu_info.append(f"GPU {i}: {mem_info.used / 1024**2:.2f} / {mem_info.total / 1024**2:.2f} MB")
+            gpu_str = " | ".join(gpu_info)
+        except NameError:
+            # pynvml was not imported
+            gpu_str = "pynvml not installed"
+        except NVMLError:
+            gpu_str = "No NVIDIA GPU found"
+        
+        system_mem = psutil.virtual_memory()
+        sys_str = f"System RAM: {system_mem.used / 1024**3:.2f} / {system_mem.total / 1024**3:.2f} GB"
+        
+        return f"{gpu_str} | {sys_str}"
+
+    def start_memory_updates():
+        while True:
+            yield get_memory_usage()
+            time.sleep(5)
+
     demo.load(
-        fn=lambda: load_history(),
+        fn=load_history,
         outputs=[image_history]
     ).then(
         fn=update_history_gallery,
         inputs=[image_history],
         outputs=[history_gallery]
     )
+    
+    demo.load(start_memory_updates, None, memory_stats)
 
 
 demo.queue(max_size=10)
