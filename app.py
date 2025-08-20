@@ -364,7 +364,7 @@ If you have any questions, feel free to open a discussion or contact us at <b>bl
 -->
 """
 
-with gr.Blocks() as demo:
+with gr.Blocks(css=".stem { font-size: 14px !important; min-height: 20px !important; }") as demo:
     gr.Markdown(_HEADER_)
     memory_stats = gr.Textbox(label="Memory Usage", interactive=False)
     with gr.Row(variant="panel"):
@@ -420,11 +420,11 @@ with gr.Blocks() as demo:
                     object_fit="contain",
                 )
                 with gr.Row(visible=False) as history_download_row:
-                    history_obj_download = gr.File(label="Download OBJ", interactive=False)
-                    history_glb_download = gr.File(label="Download GLB", interactive=False)
-                    history_stl_download = gr.File(label="Download STL", interactive=False)
-                    history_mtl_download = gr.File(label="Download MTL", interactive=False)
-                    history_png_download = gr.File(label="Download Texture", interactive=False)
+                    history_obj_download = gr.DownloadButton(label="Download OBJ")
+                    history_glb_download = gr.DownloadButton(label="Download GLB")
+                    history_stl_download = gr.DownloadButton(label="Download STL")
+                    history_mtl_download = gr.DownloadButton(label="Download MTL")
+                    history_png_download = gr.DownloadButton(label="Download Texture")
 
         with gr.Column(scale=2):
             mv_show_images = gr.Image(
@@ -453,8 +453,8 @@ with gr.Blocks() as demo:
                         label="Output Model (STL Format)",
                     )
             with gr.Row(visible=False) as download_row:
-                output_mtl = gr.File(label="Download MTL", interactive=False)
-                output_png = gr.File(label="Download Texture", interactive=False)
+                output_mtl = gr.DownloadButton(label="Download MTL")
+                output_png = gr.DownloadButton(label="Download Texture")
             gr.Markdown('''Try a different <b>seed value</b> if the result is unsatisfying (Default: 42).''')
 
     gr.Markdown(_CITE_)
