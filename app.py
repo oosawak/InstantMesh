@@ -468,7 +468,7 @@ with gr.Blocks() as demo:
     def add_to_history(image, temp_dir, history):
         if not temp_dir or not os.path.isdir(temp_dir):
             print(f"Invalid temporary directory: {temp_dir}")
-            return history, gr.update(value=history)
+            return history, gr.update(value=history), None, None, None, None, None
 
         history_root = "history"
         os.makedirs(history_root, exist_ok=True)
@@ -486,62 +486,84 @@ with gr.Blocks() as demo:
             except Exception as e:
                 print(f"Failed to save history image: {e}")
         
+        new_obj_path, new_glb_path, new_stl_path, new_mtl_path, new_png_path = None, None, None, None, None
+
         # Move and rename all files from temp_dir to the new history directory
         for filename in os.listdir(temp_dir):
             original_path = os.path.join(temp_dir, filename)
             
             # Determine the new filename based on the timestamp
             file_extension = os.path.splitext(filename)[1]
+            new_filename = f"{timestamp}{file_extension}"
             if 'albedo' in filename:
                 new_filename = f"{timestamp}_albedo{file_extension}"
-            else:
-                new_filename = f"{timestamp}{file_extension}"
-                
+            
             new_path = os.path.join(new_history_dir, new_filename)
             shutil.move(original_path, new_path)
-        
+
+            # Store the new paths
+            if new_filename.endswith('.obj'):
+                new_obj_path = new_path
+            elif new_filename.endswith('.glb'):
+                new_glb_path = new_path
+            elif new_filename.endswith('.stl'):
+                new_stl_path = new_path
+            elif new_filename.endswith('.mtl'):
+                new_mtl_path = new_path
+            elif new_filename.endswith('_albedo.png'):
+                new_png_path = new_path
+
         # Clean up the now-empty temporary directory
         try:
             os.rmdir(temp_dir)
         except OSError as e:
             print(f"Error removing temporary directory {temp_dir}: {e}")
 
-        return history, gr.update(value=history)
+        return history, gr.update(value=history), new_obj_path, new_glb_path, new_stl_path, new_mtl_path, new_png_path
 
     def on_history_select(evt: gr.SelectData, history: list):
         if evt.index is None or not history:
-            return gr.update(), gr.update(), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
-        
+            # Return updates for all outputs to avoid errors
+            return (gr.update(),) * 13
+
         try:
-            # Use the index to get the correct path from our state, not the temp path from the event value
             image_path = history[evt.index]
 
             if os.path.exists(image_path):
-                # The history item is the preview.png, its parent is the directory
                 history_item_dir = os.path.dirname(image_path)
                 
-                obj_path = glob.glob(os.path.join(history_item_dir, "*.obj"))
-                glb_path = glob.glob(os.path.join(history_item_dir, "*.glb"))
-                stl_path = glob.glob(os.path.join(history_item_dir, "*.stl"))
-                mtl_path = glob.glob(os.path.join(history_item_dir, "*.mtl"))
-                png_path = glob.glob(os.path.join(history_item_dir, "*_albedo.png"))
+                obj_path_list = glob.glob(os.path.join(history_item_dir, "*.obj"))
+                glb_path_list = glob.glob(os.path.join(history_item_dir, "*.glb"))
+                stl_path_list = glob.glob(os.path.join(history_item_dir, "*.stl"))
+                mtl_path_list = glob.glob(os.path.join(history_item_dir, "*.mtl"))
+                png_path_list = glob.glob(os.path.join(history_item_dir, "*_albedo.png"))
 
-                # Make the download row and buttons visible
+                obj_path = obj_path_list[0] if obj_path_list else None
+                glb_path = glb_path_list[0] if glb_path_list else None
+                stl_path = stl_path_list[0] if stl_path_list else None
+                mtl_path = mtl_path_list[0] if mtl_path_list else None
+                png_path = png_path_list[0] if png_path_list else None
+
                 return (
                     Image.open(image_path).convert("RGBA"), 
                     evt.index,
-                    gr.update(visible=True),
-                    gr.update(value=obj_path[0] if obj_path else None, visible=bool(obj_path)),
-                    gr.update(value=glb_path[0] if glb_path else None, visible=bool(glb_path)),
-                    gr.update(value=stl_path[0] if stl_path else None, visible=bool(stl_path)),
-                    gr.update(value=mtl_path[0] if mtl_path else None, visible=bool(mtl_path)),
-                    gr.update(value=png_path[0] if png_path else None, visible=bool(png_path)),
+                    None, # Clear mv_show_images
+                    None, # Clear output_video
+                    obj_path, # Update output_model_obj
+                    glb_path, # Update output_model_glb
+                    stl_path, # Update output_model_stl
+                    gr.update(visible=True), # Show history_download_row
+                    gr.update(value=obj_path, visible=bool(obj_path)),
+                    gr.update(value=glb_path, visible=bool(glb_path)),
+                    gr.update(value=stl_path, visible=bool(stl_path)),
+                    gr.update(value=mtl_path, visible=bool(mtl_path)),
+                    gr.update(value=png_path, visible=bool(png_path)),
                 )
         except Exception as e:
             print(f"Error loading history item: {e}")
         
         # Fallback if something goes wrong
-        return gr.update(), gr.update(), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+        return (gr.update(),) * 13
 
 
     def delete_image(history, index):
@@ -555,8 +577,8 @@ with gr.Blocks() as demo:
                     print(f"Deleted history directory: {history_item_dir}")
                 except Exception as e:
                     print(f"Failed to delete history directory: {e}")
-        # Hide download buttons after deletion
-        return history, gr.update(value=history), None, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+        # Hide download buttons and clear models after deletion
+        return history, gr.update(value=history), None, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), None, None, None
 
     submit.click(fn=check_input_image, inputs=[input_image]).then(
         fn=preprocess,
@@ -573,7 +595,7 @@ with gr.Blocks() as demo:
     ).then(
         fn=add_to_history,
         inputs=[processed_image, temp_dir_state, image_history],
-        outputs=[image_history, history_gallery]
+        outputs=[image_history, history_gallery, output_model_obj, output_model_glb, output_model_stl, mtl_fpath_state, png_fpath_state]
     )
 
     history_gallery.select(
@@ -581,7 +603,12 @@ with gr.Blocks() as demo:
         inputs=[image_history],
         outputs=[
             input_image, 
-            selected_index, 
+            selected_index,
+            mv_show_images,
+            output_video,
+            output_model_obj,
+            output_model_glb,
+            output_model_stl,
             history_download_row,
             history_obj_download,
             history_glb_download,
@@ -604,6 +631,9 @@ with gr.Blocks() as demo:
             history_stl_download,
             history_mtl_download,
             history_png_download,
+            output_model_obj,
+            output_model_glb,
+            output_model_stl,
         ],
     )
 
